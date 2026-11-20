@@ -1,0 +1,28 @@
+{
+  "packages": [
+    {
+      "source": "~/Developer/emilkowalski/skills",
+      "skills": [
+        "skills/animate",
+        "skills/animation-performance",
+        "skills/animation-vocabulary",
+        "skills/apple-design",
+        "skills/break-ui",
+        "skills/choreograph",
+        "skills/emil-design-eng",
+        "skills/find-animation-opportunities",
+        "skills/gestures",
+        "skills/improve-animations",
+        "skills/mobile-native",
+        "skills/pick-ui-library",
+        "skills/prototype",
+        "skills/remove-animations",
+        "skills/review-animations",
+        "skills/learn-taste"
+      ]
+    }
+  ],
+  "skills": [
+    "~/.pi/agent/skill-library/ui-design-principles"
+  ]
+}

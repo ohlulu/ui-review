@@ -1,0 +1,1353 @@
+#!/usr/bin/env python3
+"""uireview — before/after or after-only visual evidence for UI changes, served privately over the tailnet.
+
+Agents capture paired screenshots with a recipe (or after-only screens, from a recipe or while driving
+the simulator), fill short captions in notes.json, and publish to a fixed web shell. The owner judges
+each card from a phone; verdicts persist server-side.
+Run `uireview -h` or `uireview <command> -h` for usage. Design: docs/plan.md.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import email.utils
+import fcntl
+import hashlib
+import http.server
+import json
+import mimetypes
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Iterator, Optional
+
+SCHEMA = 2
+PORT = 8788
+TAILNET_PORT = 8787
+LAUNCH_LABEL = "com.ohlulu.ui-review"
+DECIDED_KEEP_DAYS = 7
+STALE_DAYS = 14
+BASE_IDLE_DAYS = 14
+DRAFT_DAYS = 3
+VERDICTS = ("✅", "❌", "❓")
+RUN_ID = re.compile(r"^r[0-9]{1,6}$")
+CARD_ID = re.compile(r"^C[0-9]{2,3}$")
+SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
+DAY = 86400
+
+WEB_DIR = Path(os.path.realpath(__file__)).parent / "web"
+
+
+class Fail(Exception):
+    """A user-facing error: printed without a traceback, exit 1."""
+
+
+# ---------- paths, json, locking ----------
+
+def root() -> Path:
+    return Path(os.environ.get("UIREVIEW_ROOT") or Path.home() / ".local/state/ui-review")
+
+
+def sub(name: str) -> Path:
+    path = root() / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def read_json(path: Path, default: Any = None) -> Any:
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return default
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def locked() -> Iterator[None]:
+    with open(sub("") / ".lock", "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def now() -> float:
+    return time.time()
+
+
+def run(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, text=True, capture_output=True, **kw)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def hash_tree(path: Path) -> str:
+    """Content hash of a bundle; covers the debug dylib, which holds the code of a Debug build."""
+    digest = hashlib.sha256()
+    for file in sorted(p for p in path.rglob("*") if p.is_file() and not p.is_symlink()):
+        digest.update(str(file.relative_to(path)).encode() + b"\0")
+        digest.update(sha256_file(file).encode())
+    return digest.hexdigest()[:16]
+
+
+def dir_size(path: Path) -> int:
+    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file() and not p.is_symlink()) if path.exists() else 0
+
+
+def human(size: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return str(size)
+
+
+def git_state(repo: Optional[str]) -> dict:
+    if not repo:
+        return {}
+    head = run(["git", "-C", repo, "rev-parse", "--short", "HEAD"])
+    if head.returncode:
+        return {}
+    diff = run(["git", "-C", repo, "diff", "HEAD"]).stdout
+    untracked = run(["git", "-C", repo, "ls-files", "--others", "--exclude-standard"]).stdout
+    dirty = bool(diff or untracked)
+    fingerprint = hashlib.sha256((diff + untracked).encode()).hexdigest()[:12] if dirty else None
+    branch = run(["git", "-C", repo, "branch", "--show-current"]).stdout.strip()
+    return {"sha": head.stdout.strip(), "branch": branch, "dirty": fingerprint}
+
+
+def next_run_id() -> str:
+    with locked():
+        counter = sub("") / "counter"
+        value = int(counter.read_text()) + 1 if counter.exists() else 1
+        counter.write_text(str(value))
+    return f"r{value}"
+
+
+def trash(paths: list[Path]) -> None:
+    existing = [str(p) for p in paths if p.exists()]
+    if existing:
+        done = run(["trash", *existing])
+        if done.returncode:
+            raise Fail(f"trash failed: {done.stderr.strip()}")
+
+
+def site_url() -> str:
+    if os.environ.get("UIREVIEW_URL"):
+        return os.environ["UIREVIEW_URL"].rstrip("/")
+    config = read_json(root() / "config.json", {}) or {}
+    if config.get("url"):
+        return config["url"]
+    status = run(["tailscale", "status", "--json"])
+    try:
+        host = json.loads(status.stdout)["Self"]["DNSName"].split(".")[0]
+    except (ValueError, KeyError, IndexError):
+        host = "localhost"
+    return f"http://{host}:{TAILNET_PORT}"
+
+
+# ---------- simulator ----------
+
+def installed_app(udid: str, bundle: str) -> Optional[Path]:
+    found = run(["xcrun", "simctl", "get_app_container", udid, bundle, "app"])
+    return Path(found.stdout.strip()) if found.returncode == 0 else None
+
+
+def install(udid: str, app: Path, bundle: str, expected: str) -> None:
+    done = run(["xcrun", "simctl", "install", udid, str(app)])
+    if done.returncode:
+        raise Fail(f"simctl install failed: {done.stderr.strip()}")
+    landed = installed_app(udid, bundle)
+    if not landed or hash_tree(landed) != expected:
+        raise Fail(f"installed {bundle} does not match {app} (hash {expected}); refusing to capture")
+
+
+def screenshot(udid: str, out: Path) -> None:
+    done = run(["xcrun", "simctl", "io", udid, "screenshot", "--type=png", str(out)])
+    if done.returncode:
+        raise Fail(f"simctl screenshot failed: {done.stderr.strip()}")
+
+
+def identical(a: Path, b: Path) -> bool:
+    done = run(["magick", "compare", "-metric", "AE", str(a), str(b), "null:"])
+    return done.returncode == 0
+
+
+# ---------- capture ledger ----------
+
+def work(run_id: str) -> Path:
+    return sub("work") / run_id
+
+
+def load_capture(run_id: str) -> dict:
+    capture = read_json(work(run_id) / "capture.json")
+    if capture is None:
+        raise Fail(f"no capture for {run_id} (looked in {work(run_id)})")
+    return capture
+
+
+def run_mode(capture: dict) -> str:
+    """compare: base and after replayed from one recipe. screens: after only, each card judged on its own."""
+    return "compare" if capture["base"] else "screens"
+
+
+def verify_installed(capture: dict, side: str, udid: str) -> str:
+    """The installed build decides the side: a reinstall mid-run must not pass a different build off as this side."""
+    expected = (capture.get("base") or {}).get("hash") if side == "before" else capture["after"]["hash"]
+    if side not in ("before", "after") or not expected:
+        raise Fail(f"capture {capture['run']} has no {side} build")
+    landed = installed_app(udid, capture["bundle"])
+    actual = hash_tree(landed) if landed else None
+    if actual != expected:
+        fix = ("the build changed since `uireview start`; open a new run with `uireview start`" if capture.get("interactive")
+               else "the recipe must not reinstall or rebuild the app")
+        raise Fail(f"installed {capture['bundle']} is {actual or 'missing'}, not the {side} build {expected}; {fix}")
+    return actual
+
+
+def cmd_base_save(args: argparse.Namespace) -> None:
+    app = Path(args.app).resolve()
+    if not (app / "Info.plist").exists():
+        raise Fail(f"{app} is not an app bundle")
+    base_id = f"{args.project}-{time.strftime('%Y%m%d-%H%M%S')}"
+    target = sub("base") / base_id
+    (target / "app").mkdir(parents=True)
+    copy = target / "app" / app.name
+    done = run(["cp", "-Rc", str(app), str(copy)])
+    if done.returncode:
+        raise Fail(f"cp -Rc failed: {done.stderr.strip()}")
+    meta = {"id": base_id, "project": args.project, "created": now(), "app": str(copy),
+            "hash": hash_tree(copy), "git": git_state(args.repo), "repo": args.repo}
+    write_json(target / "base.json", meta)
+    print(f"base {base_id}  hash {meta['hash']}  {meta['git'].get('sha', '')}{' dirty' if meta['git'].get('dirty') else ''}")
+
+
+def latest_base(project: str) -> Optional[dict]:
+    bases = [read_json(p / "base.json") for p in sub("base").iterdir() if (p / "base.json").exists()]
+    bases = [b for b in bases if b and b["project"] == project]
+    return max(bases, key=lambda b: b["created"]) if bases else None
+
+
+def cmd_capture(args: argparse.Namespace) -> None:
+    app = Path(args.app).resolve()
+    recipe = Path(args.recipe).resolve()
+    if not recipe.exists():
+        raise Fail(f"no recipe at {recipe}")
+    base = read_json(sub("base") / args.base / "base.json") if args.base else latest_base(args.project)
+    if args.base and not base:
+        raise Fail(f"no base {args.base}")
+    if args.no_base:
+        base = None
+    elif not base:
+        raise Fail(f"no base saved for project {args.project}: run `uireview base save` before touching the UI, "
+                   "or pass --no-base for an after-only screens run")
+    after_hash = hash_tree(app)
+    run_id = next_run_id()
+    folder = work(run_id)
+    folder.mkdir(parents=True)
+    shutil.copy2(recipe, folder / "recipe.sh")
+    capture = {
+        "run": run_id, "project": args.project, "title": args.title, "created": now(),
+        "udid": args.udid, "bundle": args.bundle, "rotate": args.rotate, "round_of": args.round_of,
+        "recipe": {"path": str(recipe), "sha256": sha256_file(recipe)},
+        "base": {k: base[k] for k in ("id", "hash", "git")} if base else None,
+        "after": {"hash": after_hash, "git": git_state(args.repo), "app": str(app)},
+        "identical_builds": bool(base and base["hash"] == after_hash), "interactive": False,
+        "sides": {}, "shots": [], "clips": [],
+    }
+    write_json(folder / "capture.json", capture)
+    sides = ([("before", Path(base["app"]), base["hash"])] if base else []) + [("after", app, after_hash)]
+    run(["xcrun", "simctl", "status_bar", args.udid, "override", "--time", "09:41", "--batteryState", "charged",
+         "--batteryLevel", "100", "--cellularBars", "4", "--wifiBars", "3"])
+    try:
+        for side, bundle_path, expected in sides:
+            print(f"⏳ {run_id} {side}: installing {bundle_path.name} ({expected})", file=sys.stderr)
+            install(args.udid, bundle_path, args.bundle, expected)
+            env = dict(os.environ, UIREVIEW_RUN=run_id, UIREVIEW_SIDE=side, UIREVIEW_UDID=args.udid,
+                       UIREVIEW_BUNDLE=args.bundle, UIREVIEW_ROOT=str(root()))
+            started = now()
+            done = subprocess.run(["bash", str(folder / "recipe.sh")], cwd=args.cwd or os.getcwd(), env=env,
+                                  stdout=sys.stderr, timeout=args.timeout)
+            capture = load_capture(run_id)
+            capture["sides"][side] = {"exit": done.returncode, "seconds": round(now() - started, 1)}
+            write_json(folder / "capture.json", capture)
+            if done.returncode:
+                print(f"⚠️  {side} recipe exited {done.returncode}; its cards keep the shots taken so far", file=sys.stderr)
+    finally:
+        try:
+            landed = installed_app(args.udid, args.bundle)
+            if landed is None or hash_tree(landed) != after_hash:
+                install(args.udid, app, args.bundle, after_hash)
+        finally:
+            run(["xcrun", "simctl", "status_bar", args.udid, "clear"])
+    capture = load_capture(run_id)
+    write_json(folder / "notes.json", skeleton(capture))
+    shots = len(capture["shots"])
+    print(f"{run_id}: {shots} shot(s) → fill {folder / 'notes.json'}, then `uireview publish {run_id}`")
+    for warning in duplicate_screens(capture):
+        print(f"⚠️  {warning} — the recipe probably did not reach the next screen")
+    for clip in capture.get("clips", []):
+        if clip["error"]:
+            print(f"⚠️  clip {clip['side']}/{clip['name']}: {clip['error']}")
+    if capture["identical_builds"]:
+        print("note: base and after are the same build (A/A); every card should come out UNCHANGED")
+
+
+def cmd_start(args: argparse.Namespace) -> None:
+    installed = installed_app(args.udid, args.bundle)
+    if installed is None:
+        raise Fail(f"{args.bundle} is not installed on {args.udid}; build and install it first")
+    after_hash = hash_tree(installed)
+    run_id = next_run_id()
+    capture = {
+        "run": run_id, "project": args.project, "title": args.title, "created": now(),
+        "udid": args.udid, "bundle": args.bundle, "rotate": args.rotate, "round_of": args.round_of, "recipe": None,
+        "base": None, "after": {"hash": after_hash, "git": git_state(args.repo), "app": str(installed)},
+        "identical_builds": False, "interactive": True, "sides": {}, "shots": [], "clips": [],
+    }
+    write_json(work(run_id) / "capture.json", capture)
+    sync_notes(run_id)
+    print(f"{run_id}: screens run on the installed build {after_hash}. Drive the simulator to each state, then "
+          f"`uireview shot <slug> --run {run_id} --label \"Title\"`; fill {work(run_id) / 'notes.json'}; "
+          f"`uireview publish {run_id}`")
+
+
+def duplicate_screens(capture: dict) -> list[str]:
+    seen: dict[tuple[str, str], str] = {}
+    warnings = []
+    for shot in capture["shots"]:
+        key = (shot["side"], shot["sha256"])
+        if key in seen:
+            warnings.append(f"{shot['side']}: {seen[key]} and {shot['name']} are pixel-identical")
+        else:
+            seen[key] = shot["name"]
+    return warnings
+
+
+def card_names(capture: dict) -> list[str]:
+    names: list[str] = []
+    for side in ("after", "before"):
+        for shot in capture["shots"]:
+            if shot["side"] == side and shot["name"] not in names:
+                names.append(shot["name"])
+    return names
+
+
+def skeleton(capture: dict) -> dict:
+    labels = {s["name"]: s.get("label") or s["name"] for s in capture["shots"]}
+    return {
+        "title": capture["title"], "judge": "", "checks": [],
+        "cards": [{"id": f"C{i:02d}", "name": name, "label": labels[name], "what": "", "look": [],
+                   "question": "", "roi": []} for i, name in enumerate(card_names(capture), 1)],
+    }
+
+
+def sync_notes(run_id: str) -> None:
+    """Keeps an interactive run's notes.json in step with its shots: new cards are appended, filled ones kept."""
+    capture = load_capture(run_id)
+    path = work(run_id) / "notes.json"
+    try:
+        notes = read_json(path) or {**skeleton(capture), "cards": []}
+    except ValueError as error:
+        raise Fail(f"{path} is not valid JSON ({error}); fix it before taking more shots")
+    have = {card.get("name") for card in notes.get("cards", [])}
+    notes.setdefault("cards", []).extend(c for c in skeleton(capture)["cards"] if c["name"] not in have)
+    write_json(path, notes)
+
+
+def shooting_context(args: argparse.Namespace, verb: str) -> tuple[str, str, str]:
+    """(run, side, udid): from --run for a run opened by `start`, otherwise from the recipe environment `capture` sets."""
+    if args.run:
+        capture = load_capture(args.run)
+        if not capture.get("interactive"):
+            raise Fail(f"{args.run} replays a recipe; --run works only on a run opened with `uireview start`")
+        return args.run, "after", capture["udid"]
+    run_id, side, udid = (os.environ.get(k) for k in ("UIREVIEW_RUN", "UIREVIEW_SIDE", "UIREVIEW_UDID"))
+    if not (run_id and side and udid):
+        raise Fail(f"uireview {verb} runs inside a recipe started by `uireview capture`, "
+                   "or with --run on a run opened by `uireview start`")
+    return run_id, side, udid
+
+
+def cmd_shot(args: argparse.Namespace) -> None:
+    run_id, side, udid = shooting_context(args, "shot")
+    if not SLUG.match(args.name):
+        raise Fail(f"shot name {args.name!r} must be a lowercase slug (a-z, 0-9, -)")
+    capture = load_capture(run_id)
+    if capture.get("interactive"):
+        sync_notes(run_id)  # a broken notes.json must stop the shot before it is recorded
+    folder = work(run_id) / "shots" / side
+    folder.mkdir(parents=True, exist_ok=True)
+    out = folder / f"{args.name}.png"
+    if any(s["name"] == args.name and s["side"] == side for s in capture["shots"]):
+        raise Fail(f"{args.name} already shot on the {side} side of {run_id}")
+    app_hash = verify_installed(capture, side, udid)
+    stable = False
+    with tempfile.TemporaryDirectory() as tmp:
+        previous = None
+        for attempt in range(args.tries):
+            frame = Path(tmp) / f"{attempt}.png"
+            screenshot(udid, frame)
+            if previous and identical(previous, frame):
+                stable = True
+                break
+            previous = frame
+            time.sleep(args.interval)
+        source = frame
+        if capture.get("rotate"):
+            rotated = run(["magick", str(source), "-rotate", str(capture["rotate"]), str(out)])
+            if rotated.returncode:
+                raise Fail(f"rotate failed: {rotated.stderr.strip()}")
+        else:
+            shutil.copy2(source, out)
+    ax = run(["sim-use", "describe-ui", "--device", udid, "--json", "--no-raw"])
+    ax_path = folder / f"{args.name}.ax.json"
+    ax_path.write_text(ax.stdout if ax.returncode == 0 else "{}")
+    digest = sha256_file(out)
+    with locked():
+        capture = load_capture(run_id)
+        twin = next((s["name"] for s in capture["shots"] if s["side"] == side and s["sha256"] == digest), None)
+        capture["shots"].append({"name": args.name, "side": side, "label": args.label, "file": str(out.relative_to(work(run_id))),
+                                 "sha256": digest, "time": now(), "stable": stable, "app": app_hash,
+                                 "ax": str(ax_path.relative_to(work(run_id))) if ax.returncode == 0 else None})
+        write_json(work(run_id) / "capture.json", capture)
+        if capture.get("interactive"):
+            sync_notes(run_id)
+    print(f"📸 {side}/{args.name}{'' if stable else ' (UNSTABLE: frames kept changing)'}", file=sys.stderr)
+    if twin:
+        print(f"⚠️  {side}/{args.name} is pixel-identical to {twin}: the app probably had not reached the new screen",
+              file=sys.stderr)
+
+
+# ---------- recordings ----------
+
+MAX_CLIPS = 3
+START_TIMEOUT = 10.0
+STOP_WAIT = 10.0
+LEAD_IN = 0.3
+TAIL_FREEZE = 0.5
+ROTATE_FILTER = {0: "", 90: "transpose=1,", 180: "hflip,vflip,", 270: "transpose=2,"}
+
+
+class Interrupted(Exception):
+    """The clip wrapper got SIGTERM / SIGHUP; the recorder still has to be stopped."""
+
+
+def recorder_cmd(udid: str, out: Path) -> list[str]:
+    return ["xcrun", "simctl", "io", udid, "recordVideo", "--codec=h264", "--force", str(out)]
+
+
+def stop_leftover_recorders(udid: str) -> None:
+    pids = [int(p) for p in run(["pgrep", "-f", f"simctl io {udid} recordVideo"]).stdout.split()]
+    for sig, wait in ((signal.SIGINT, STOP_WAIT), (signal.SIGKILL, 1.0)):
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, sig)
+        deadline = now() + wait
+        while pids and now() < deadline:
+            pids = [p for p in pids if run(["kill", "-0", str(p)]).returncode == 0]
+            time.sleep(0.2)
+
+
+def wait_started(proc: subprocess.Popen, timeout: float) -> bool:
+    """Waits for simctl's documented 'Recording started' line; keeps draining stderr afterwards."""
+    started = threading.Event()
+
+    def drain() -> None:
+        with proc.stderr:
+            for line in proc.stderr:
+                if "Recording started" in line:
+                    started.set()
+
+    threading.Thread(target=drain, daemon=True).start()
+    return started.wait(timeout)
+
+
+def stop_recorder(proc: subprocess.Popen) -> bool:
+    """SIGINT, wait, SIGINT again, then SIGKILL. False means it had to be killed: the simulator needs a reboot."""
+    for _ in range(2):
+        if proc.poll() is not None:
+            return True
+        proc.send_signal(signal.SIGINT)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=STOP_WAIT)
+            return True
+    proc.kill()
+    proc.wait()
+    return False
+
+
+def video_duration(path: Path) -> Optional[float]:
+    probe = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "format=duration",
+                 "-of", "default=nw=1:nk=1", str(path)])
+    try:
+        return float(probe.stdout.strip()) if probe.returncode == 0 else None
+    except ValueError:
+        return None
+
+
+def ffmpeg(*argv: str) -> None:
+    done = run(["ffmpeg", "-v", "error", "-y", *argv])
+    if done.returncode:
+        raise Fail(f"ffmpeg failed: {done.stderr.strip()[-400:]}")
+
+
+H264 = ("-c:v", "libx264", "-crf", "24", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an")
+
+
+def stack_filter(durations: tuple[float, float]) -> str:
+    """before above after; both padded with their last frame to the longer one, plus a short freeze."""
+    longest = max(durations) + TAIL_FREEZE
+    pads = [f"[{i}]tpad=stop_mode=clone:stop_duration={longest - d:.3f}[v{i}]" for i, d in enumerate(durations)]
+    return ";".join(pads) + ";[v0][v1]vstack"
+
+
+def raise_interrupted(signum: int, frame: Any) -> None:
+    raise Interrupted(signal.Signals(signum).name)
+
+
+def cmd_clip(args: argparse.Namespace) -> None:
+    run_id, side, udid = shooting_context(args, "clip")
+    if not SLUG.match(args.name):
+        raise Fail(f"clip name {args.name!r} must be a lowercase slug (a-z, 0-9, -)")
+    command = args.command
+    if not command:
+        raise Fail("usage: uireview clip <name> -- <command that drives the app>")
+    capture = load_capture(run_id)
+    clips = capture.get("clips", [])
+    if any(c["name"] == args.name and c["side"] == side for c in clips):
+        raise Fail(f"{args.name} already recorded on the {side} side of {run_id}")
+    names = {c["name"] for c in clips}
+    if args.name not in names and len(names) >= MAX_CLIPS:
+        raise Fail(f"at most {MAX_CLIPS} clips per run; keep recordings for motion and timing changes")
+    app_hash = verify_installed(capture, side, udid)
+    folder = work(run_id) / "clips" / side
+    folder.mkdir(parents=True, exist_ok=True)
+    out = folder / f"{args.name}.mp4"
+    record: dict = {"name": args.name, "side": side, "label": args.label, "time": now(), "file": None, "app": app_hash,
+                    "sha256": None, "duration": None, "action_exit": None, "error": None, "needs_reboot": False}
+    interrupted = False
+    stop_leftover_recorders(udid)
+    with tempfile.TemporaryDirectory() as tmp:
+        raw = Path(tmp) / "raw.mp4"
+        previous = {s: signal.signal(s, raise_interrupted) for s in (signal.SIGTERM, signal.SIGHUP)}
+        proc = subprocess.Popen(recorder_cmd(udid, raw), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            if not wait_started(proc, START_TIMEOUT):
+                record["error"] = f"recorder did not report 'Recording started' within {START_TIMEOUT:.0f} s"
+            else:
+                time.sleep(LEAD_IN)
+                try:
+                    record["action_exit"] = subprocess.run(command, timeout=args.timeout).returncode
+                except subprocess.TimeoutExpired:
+                    record["action_exit"], record["error"] = 124, f"action ran past {args.timeout:.0f} s"
+                time.sleep(args.settle)
+        except Interrupted as signal_name:
+            interrupted = True
+            record["error"] = f"interrupted by {signal_name}"
+        finally:
+            if not stop_recorder(proc):
+                record["needs_reboot"] = True
+                hung = "recorder ignored SIGINT twice and was killed; reboot the simulator before recording again"
+                record["error"] = f"{record['error']}; {hung}" if record["error"] else hung
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+        if raw.exists() and video_duration(raw) is not None and not record["needs_reboot"]:
+            rotate = ROTATE_FILTER[int(capture.get("rotate") or 0)]
+            ffmpeg("-i", str(raw), "-vf", f"{rotate}fps=60,scale=1280:-2", *H264, str(out))
+            record.update(file=str(out.relative_to(work(run_id))), sha256=sha256_file(out), duration=video_duration(out))
+        elif not record["error"]:
+            record["error"] = "recorder produced no readable video"
+    with locked():
+        capture = load_capture(run_id)
+        capture.setdefault("clips", []).append(record)
+        write_json(work(run_id) / "capture.json", capture)
+    if record["file"]:
+        print(f"🎬 {side}/{args.name} {record['duration']:.1f} s{'' if not record['error'] else ' (' + record['error'] + ')'}", file=sys.stderr)
+    else:
+        print(f"⚠️  {side}/{args.name}: no video — {record['error']}", file=sys.stderr)
+    if interrupted:
+        raise SystemExit(130)
+    if record["action_exit"]:
+        raise SystemExit(record["action_exit"])
+
+
+def card_video(card_id: str, name: str, capture: dict, folder: Path, staging: Path) -> tuple[Optional[dict], Optional[str]]:
+    """Builds the card's mp4 (before stacked above after) and reports any recording failure."""
+    mine = [c for c in capture.get("clips", []) if c["name"] == name]
+    errors = "; ".join(f"{c['side']}: {c['error']}" for c in mine if c["error"] and not c["file"]) or None
+    usable = {c["side"]: c for c in mine if c["file"]}
+    if not usable:
+        return None, errors
+    target = staging / f"{card_id}.mp4"
+    if len(usable) == 2:
+        before, after = usable["before"], usable["after"]
+        ffmpeg("-i", str(folder / before["file"]), "-i", str(folder / after["file"]), "-filter_complex",
+               stack_filter((before["duration"], after["duration"])), *H264, str(target))
+    else:
+        shutil.copy2(folder / next(iter(usable.values()))["file"], target)
+    return {"src": target.name, "sides": [s for s in ("before", "after") if s in usable]}, errors
+
+
+# ---------- publish ----------
+
+NOTE_RUN_KEYS = {"title", "judge", "checks", "cards"}
+NOTE_CARD_KEYS = {"id", "name", "label", "what", "look", "question", "roi"}
+ROI_KEYS = {"id", "nth", "rect", "label"}
+
+
+def validate_notes(notes: dict, capture: dict, statuses: dict[str, str]) -> list[str]:
+    errors = []
+    expected = skeleton(capture)["cards"]
+    if set(notes) - NOTE_RUN_KEYS:
+        errors.append(f"unknown run keys: {sorted(set(notes) - NOTE_RUN_KEYS)}")
+    if not isinstance(notes.get("checks", []), list) or not all(isinstance(c, str) for c in notes.get("checks", [])):
+        errors.append("checks must be a list of strings")
+    for key in ("title", "judge"):
+        if not isinstance(notes.get(key, ""), str):
+            errors.append(f"`{key}` must be a string")
+    cards = notes.get("cards", [])
+    if [(c.get("id"), c.get("name")) for c in cards] != [(c["id"], c["name"]) for c in expected]:
+        errors.append("cards must keep the ids and names of the skeleton, in order "
+                      f"({', '.join(c['id'] + '=' + c['name'] for c in expected)})")
+        return errors
+    for card in cards:
+        where = card["id"]
+        if set(card) - NOTE_CARD_KEYS:
+            errors.append(f"{where}: unknown keys {sorted(set(card) - NOTE_CARD_KEYS)}")
+        texts = [key for key in ("label", "what", "question") if not isinstance(card.get(key, ""), str)]
+        if texts:
+            errors.append(f"{where}: {', '.join('`' + k + '`' for k in texts)} must be strings")
+        elif statuses.get(card["name"]) != "UNCHANGED" and not card.get("what", "").strip():
+            errors.append(f"{where}: `what` is required for a {statuses.get(card['name'])} card")
+        look = card.get("look", [])
+        if not isinstance(look, list) or len(look) > 3 or not all(isinstance(item, str) for item in look):
+            errors.append(f"{where}: `look` is a list of at most 3 strings")
+        for roi in card.get("roi", []):
+            if not isinstance(roi, dict) or set(roi) - ROI_KEYS or not (("id" in roi) ^ ("rect" in roi)):
+                errors.append(f"{where}: roi needs exactly one of id / rect (keys {sorted(ROI_KEYS)})")
+            elif "rect" in roi and (len(roi["rect"]) != 4 or not all(isinstance(v, (int, float)) for v in roi["rect"])):
+                errors.append(f"{where}: rect is [x, y, w, h] in points")
+    return errors
+
+
+def ax_frame(ax: dict, uid: str, nth: int) -> Optional[tuple[float, float, float, float]]:
+    entries = [e for e in (ax.get("data") or {}).get("entries", []) if e.get("uniqueId") == uid.lstrip("#")]
+    if len(entries) <= nth:
+        return None
+    f = entries[nth]["frame"]
+    return f["x"], f["y"], f["width"], f["height"]
+
+
+def union(rects: list[tuple[float, float, float, float]], pad: float, bound: tuple[float, float]) -> tuple[int, int, int, int]:
+    x0 = max(0.0, min(r[0] for r in rects) - pad)
+    y0 = max(0.0, min(r[1] for r in rects) - pad)
+    x1 = min(bound[0], max(r[0] + r[2] for r in rects) + pad)
+    y1 = min(bound[1], max(r[1] + r[3] for r in rects) + pad)
+    return round(x0), round(y0), round(x1 - x0), round(y1 - y0)
+
+
+def image_size(path: Path) -> tuple[int, int]:
+    done = run(["magick", "identify", "-format", "%w %h", str(path)])
+    w, h = done.stdout.split()
+    return int(w), int(h)
+
+
+def magick(*argv: str) -> None:
+    done = run(["magick", *argv])
+    if done.returncode:
+        raise Fail(f"magick {' '.join(argv[:3])}… failed: {done.stderr.strip()}")
+
+
+def card_status(capture: dict, name: str, shots: dict) -> str:
+    before, after = shots.get(("before", name)), shots.get(("after", name))
+    if not after:
+        return "MISSING AFTER"
+    if not before:
+        return "SCREEN" if run_mode(capture) == "screens" else "NEW"
+    done = run(["magick", "compare", "-metric", "AE", "-fuzz", "1%", str(work(capture["run"]) / before["file"]),
+                str(work(capture["run"]) / after["file"]), "null:"])
+    return "UNCHANGED" if done.returncode == 0 else "CHANGED"
+
+
+def cmd_publish(args: argparse.Namespace) -> None:
+    capture = load_capture(args.run)
+    folder = work(args.run)
+    notes = read_json(folder / "notes.json")
+    if notes is None:
+        raise Fail(f"no notes.json in {folder}")
+    shots = {(s["side"], s["name"]): s for s in capture["shots"]}
+    for shot in capture["shots"]:
+        if sha256_file(folder / shot["file"]) != shot["sha256"]:
+            raise Fail(f"{shot['file']} changed after capture; re-run the capture instead of editing shots")
+    names = card_names(capture)
+    for clip in capture.get("clips", []):
+        if clip["name"] not in names:
+            raise Fail(f"clip {clip['name']} has no `uireview shot {clip['name']}`; every clip belongs to a card")
+        if clip["file"] and sha256_file(folder / clip["file"]) != clip["sha256"]:
+            raise Fail(f"{clip['file']} changed after capture; re-run the capture instead of editing clips")
+    statuses = {name: card_status(capture, name, shots) for name in names}
+    for clip in capture.get("clips", []):
+        if statuses[clip["name"]] == "UNCHANGED":
+            statuses[clip["name"]] = "MOTION"
+    errors = validate_notes(notes, capture, statuses)
+    if errors:
+        raise Fail("notes.json is not publishable:\n  " + "\n  ".join(errors))
+    staging = sub("runs") / f".{args.run}.staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir()
+    cards = []
+    for card in notes["cards"]:
+        name = card["name"]
+        entry = {k: card.get(k) for k in ("id", "name", "label", "what", "look", "question")}
+        video, video_error = card_video(card["id"], name, capture, folder, staging)
+        entry.update(status=statuses[name], rois=[], video=video, video_error=video_error, stable=True)
+        axes = {}
+        for side in ("before", "after"):
+            shot = shots.get((side, name))
+            if not shot:
+                continue
+            src = folder / shot["file"]
+            target = f"{card['id']}-{side}.webp"
+            magick(str(src), "-resize", "1400x>", "-quality", "80", str(staging / target))
+            w, h = image_size(src)
+            entry[side] = {"img": target, "w": w, "h": h, "at": shot["time"]}
+            entry["stable"] = entry["stable"] and shot["stable"]
+            axes[side] = (src, read_json(folder / shot["ax"], {}) if shot.get("ax") else {}, w, h)
+        for index, roi in enumerate(card.get("roi", []), 1):
+            rects, scale, bound = [], None, None
+            for side, (src, ax, w, h) in axes.items():
+                screen = (ax.get("data") or {}).get("screen") or {}
+                scale = w / screen["width"] if screen.get("width") else 2.0
+                bound = (w / scale, h / scale)
+                frame = tuple(roi["rect"]) if "rect" in roi else ax_frame(ax, roi["id"], roi.get("nth", 0))
+                if frame:
+                    rects.append(frame)
+            if not rects:
+                raise Fail(f"{card['id']}: roi {roi.get('id')} is on neither side's accessibility tree")
+            x, y, rw, rh = union(rects, 12, bound)
+            pair = {"label": roi.get("label") or roi.get("id") or "ROI"}
+            for side, (src, ax, w, h) in axes.items():
+                target = f"{card['id']}-roi{index}-{side}.webp"
+                magick(str(src), "-crop", f"{round(rw * scale)}x{round(rh * scale)}+{round(x * scale)}+{round(y * scale)}",
+                       "+repage", "-quality", "85", str(staging / target))
+                pair[side] = target
+            pair["width_pt"] = rw
+            entry["rois"].append(pair)
+        cards.append(entry)
+    manifest = {
+        "schema": SCHEMA, "run": args.run, "mode": run_mode(capture), "project": capture["project"],
+        "title": notes.get("title") or capture["title"],
+        "judge": notes.get("judge", ""), "checks": notes.get("checks", []), "created": capture["created"],
+        "published": now(), "round_of": capture.get("round_of"), "base": capture["base"],
+        "after": {k: capture["after"][k] for k in ("hash", "git")}, "identical_builds": capture["identical_builds"],
+        "sides": capture["sides"], "cards": cards,
+    }
+    write_json(staging / "manifest.json", manifest)
+    with locked():
+        target = sub("runs") / args.run
+        verdict = read_json(target / "verdict.json", None) or empty_verdict()
+        settle_decided_at(manifest, verdict)
+        write_json(staging / "verdict.json", verdict)
+        if target.exists():
+            trash([target])
+        os.replace(staging, target)
+        if capture.get("round_of"):
+            supersede(capture["round_of"], args.run)
+    changed = sum(c["status"] != "UNCHANGED" for c in cards)
+    prune(dry_run=False, quiet=True)
+    problems = [what for passed, what, _ in site_checks() if not passed]
+    if problems:
+        print(f"uireview: {args.run} is published but the site is not reachable ({'; '.join(problems)}); "
+              "run `uireview doctor` before handing out the link", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"{site_url()}/#{args.run}  ({len(cards)} card(s), {changed} need a look)")
+
+
+def settle_decided_at(manifest: dict, verdict: dict) -> None:
+    """Retention counts from decided_at, so a run decided on publish (nothing to judge) must carry one."""
+    decided = is_decided(manifest, verdict)
+    if decided != bool(verdict.get("decided_at")):
+        verdict["decided_at"] = now() if decided else None
+        verdict["rev"] += 1
+
+
+def supersede(old: str, new: str) -> None:
+    path = sub("runs") / old / "verdict.json"
+    if (sub("runs") / old).exists():
+        verdict = read_json(path, None) or empty_verdict()
+        verdict.update(superseded_by=new, decided_at=verdict.get("decided_at") or now(), rev=verdict["rev"] + 1)
+        write_json(path, verdict)
+
+
+# ---------- verdicts and run status ----------
+
+def empty_verdict() -> dict:
+    return {"rev": 0, "cards": {}, "closed": False, "decided_at": None, "superseded_by": None}
+
+
+def load_run(run_id: str) -> tuple[dict, dict]:
+    folder = sub("runs") / run_id
+    manifest = read_json(folder / "manifest.json")
+    if manifest is None:
+        raise Fail(f"no published run {run_id}")
+    return manifest, read_json(folder / "verdict.json", None) or empty_verdict()
+
+
+def needs_verdict(manifest: dict) -> list[str]:
+    return [c["id"] for c in manifest["cards"] if c["status"] != "UNCHANGED"]
+
+
+def is_decided(manifest: dict, verdict: dict) -> bool:
+    if verdict.get("closed") or verdict.get("superseded_by"):
+        return True
+    return all(verdict["cards"].get(cid, {}).get("v") in ("✅", "❌") for cid in needs_verdict(manifest))
+
+
+def summary(manifest: dict, verdict: dict) -> dict:
+    decided = is_decided(manifest, verdict)
+    counts = {v: sum(1 for c in verdict["cards"].values() if c.get("v") == v) for v in VERDICTS}
+    return {
+        "id": manifest["run"], "project": manifest["project"], "title": manifest["title"],
+        "created": manifest["created"], "published": manifest["published"], "cards": len(manifest["cards"]),
+        "need": len(needs_verdict(manifest)), "counts": counts, "decided": decided,
+        "remaining": sum(verdict["cards"].get(cid, {}).get("v") not in ("✅", "❌") for cid in needs_verdict(manifest)),
+        "decided_at": verdict.get("decided_at"), "closed": verdict.get("closed", False),
+        "superseded_by": verdict.get("superseded_by"), "round_of": manifest.get("round_of"),
+        "stale": not decided and now() - manifest["published"] > STALE_DAYS * DAY,
+    }
+
+
+def apply_verdict(run_id: str, body: dict) -> tuple[int, dict]:
+    """Validates and stores a verdict update; returns (http status, current verdict)."""
+    manifest, current = load_run(run_id)
+    if set(body) - {"rev", "cards", "closed"} or type(body.get("rev")) is not int or type(body.get("closed", False)) is not bool:
+        return 400, {"error": "body is {rev: int, cards?: object, closed?: bool}"}
+    ids = {c["id"] for c in manifest["cards"]}
+    cards = body.get("cards", {})
+    if not isinstance(cards, dict):
+        return 400, {"error": "cards must be an object"}
+    for cid, value in cards.items():
+        if cid not in ids or not isinstance(value, dict) or set(value) - {"v", "note"}:
+            return 400, {"error": f"bad card {cid}"}
+        note = value.get("note", "")
+        if value.get("v") not in (*VERDICTS, None) or not isinstance(note, str) or len(note) > 1000:
+            return 400, {"error": f"bad verdict for {cid}"}
+    with locked():
+        manifest, current = load_run(run_id)
+        if body["rev"] != current["rev"]:
+            return 409, current
+        for cid, value in cards.items():
+            current["cards"][cid] = {"v": value.get("v"), "note": value.get("note", "").strip(), "at": now()}
+        if "closed" in body:
+            current["closed"] = body["closed"]
+        decided = is_decided(manifest, current)
+        current["decided_at"] = (current.get("decided_at") or now()) if decided else None
+        current["rev"] += 1
+        write_json(sub("runs") / run_id / "verdict.json", current)
+    return 200, current
+
+
+def cmd_verdict(args: argparse.Namespace) -> None:
+    manifest, verdict = load_run(args.run)
+    if args.json:
+        print(json.dumps({"summary": summary(manifest, verdict), "verdict": verdict}, ensure_ascii=False, indent=2))
+        return
+    info = summary(manifest, verdict)
+    state = "decided" if info["decided"] else f"pending ({info['need']} card(s) need a verdict)"
+    print(f"{args.run} {manifest['title']} — {state}")
+    for card in manifest["cards"]:
+        mark = verdict["cards"].get(card["id"], {})
+        note = f"  {mark['note']}" if mark.get("note") else ""
+        print(f"  {card['id']} {card['name']:<28} {card['status']:<12} {mark.get('v') or '·'}{note}")
+
+
+def cmd_close(args: argparse.Namespace) -> None:
+    _, verdict = load_run(args.run)
+    status, current = apply_verdict(args.run, {"rev": verdict["rev"], "closed": not args.reopen})
+    if status != 200:
+        raise Fail(f"close failed: {current}")
+    print(f"{args.run} {'reopened' if args.reopen else 'closed'}")
+
+
+def list_runs() -> list[dict]:
+    runs = []
+    for folder in sub("runs").iterdir():
+        if folder.name.startswith(".") or not (folder / "manifest.json").exists():
+            continue
+        manifest = read_json(folder / "manifest.json")
+        verdict = read_json(folder / "verdict.json", None) or empty_verdict()
+        if manifest.get("schema") != SCHEMA:
+            runs.append({"id": folder.name, "unsupported": manifest.get("schema"), "published": manifest.get("published", 0)})
+            continue
+        runs.append(summary(manifest, verdict))
+    return sorted(runs, key=lambda r: r["published"], reverse=True)
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    runs = list_runs()
+    if args.json:
+        print(json.dumps(runs, ensure_ascii=False, indent=2))
+        return
+    for r in runs:
+        if r.get("unsupported"):
+            print(f"{r['id']:<6} schema {r['unsupported']} (unsupported)")
+            continue
+        state = "decided" if r["decided"] else ("STALE" if r["stale"] else "pending")
+        print(f"{r['id']:<6} {state:<8} {r['project']:<10} {r['title']}")
+
+
+# ---------- retention ----------
+
+def prune_plan(at: Optional[float] = None) -> list[tuple[Path, str]]:
+    """What retention would move to the Trash now. A base goes only with every run that used it."""
+    at = at or now()
+    plan: list[tuple[Path, str]] = []
+    decided, published = set(), set()
+    users: dict[str, set[str]] = {}
+    expiring: set[str] = set()
+    for folder in sub("runs").iterdir():
+        if folder.name.startswith("."):
+            if at - folder.stat().st_mtime > DAY:
+                plan.append((folder, "leftover staging"))
+            continue
+        manifest = read_json(folder / "manifest.json")
+        if not manifest:
+            continue
+        published.add(folder.name)
+        verdict = read_json(folder / "verdict.json", None) or empty_verdict()
+        base = (manifest.get("base") or {}).get("id")
+        if base:
+            users.setdefault(base, set()).add(folder.name)
+        if is_decided(manifest, verdict):
+            decided.add(folder.name)
+            decided_at = verdict.get("decided_at") or manifest["published"]
+            if at - decided_at > DECIDED_KEEP_DAYS * DAY:
+                plan.append((folder, f"decided {int((at - decided_at) / DAY)} days ago"))
+                expiring.add(folder.name)
+    for folder in sub("work").iterdir():
+        capture = read_json(folder / "capture.json") or {}
+        base = (capture.get("base") or {}).get("id")
+        if base:
+            users.setdefault(base, set()).add(folder.name)
+        if folder.name in decided:
+            plan.append((folder, "raw shots of a decided run"))
+        elif folder.name not in published and at - capture.get("created", folder.stat().st_mtime) > DRAFT_DAYS * DAY:
+            plan.append((folder, f"unpublished draft older than {DRAFT_DAYS} days"))
+            expiring.add(folder.name)
+    for folder in sub("base").iterdir():
+        meta = read_json(folder / "base.json") or {}
+        runs_using = users.get(folder.name, set())
+        if runs_using and runs_using <= expiring:
+            plan.append((folder, f"base of expired runs {', '.join(sorted(runs_using))}"))
+        elif not runs_using and at - meta.get("created", folder.stat().st_mtime) > BASE_IDLE_DAYS * DAY:
+            plan.append((folder, f"unused base older than {BASE_IDLE_DAYS} days"))
+    return plan
+
+
+def prune(dry_run: bool, quiet: bool = False) -> None:
+    with locked():
+        plan = prune_plan()
+        total = sum(dir_size(p) for p, _ in plan)
+        if not quiet or plan:
+            for path, why in plan:
+                print(f"{'would trash' if dry_run else 'trash'} {path.relative_to(root())}  ({human(dir_size(path))}, {why})",
+                      file=sys.stderr if quiet else sys.stdout)
+        if not dry_run:
+            trash([p for p, _ in plan])
+    if plan and not dry_run:
+        print(f"moved {human(total)} to the Trash — space comes back when the Trash is emptied", file=sys.stderr)
+    elif not plan and not quiet:
+        print("nothing to prune")
+
+
+def cmd_prune(args: argparse.Namespace) -> None:
+    prune(dry_run=args.dry_run)
+    print(f"state root {root()}: {human(dir_size(root()))}")
+
+
+# ---------- server ----------
+
+def parse_range(header: Optional[str], size: int) -> Optional[tuple[int, int]]:
+    """Returns (start, end) inclusive for a single byte range; None means serve the whole body.
+
+    Raises ValueError for an unsatisfiable range (416)."""
+    if not header or not header.startswith("bytes=") or "," in header:
+        return None
+    first, _, last = header[6:].strip().partition("-")
+    if first == "" and last == "":
+        return None
+    if first == "":
+        length = int(last)
+        if length == 0:
+            raise ValueError
+        return max(0, size - length), size - 1
+    start = int(first)
+    end = min(int(last), size - 1) if last else size - 1
+    if start >= size or start > end:
+        raise ValueError
+    return start, end
+
+
+_tailnet_hosts: set[str] = set()
+
+
+def tailnet_hosts() -> set[str]:
+    """Host headers tailscale serve forwards (short and full MagicDNS name); cached once tailscale answers."""
+    if not _tailnet_hosts:
+        status = run(["tailscale", "status", "--json"])
+        try:
+            fqdn = json.loads(status.stdout)["Self"]["DNSName"].rstrip(".")
+        except (ValueError, KeyError, TypeError):
+            fqdn = ""
+        if fqdn:
+            _tailnet_hosts.update({f"{fqdn}:{TAILNET_PORT}", f"{fqdn.split('.')[0]}:{TAILNET_PORT}"})
+    return _tailnet_hosts | {urllib.parse.urlsplit(site_url()).netloc}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "uireview"
+
+    def trusted_host(self) -> bool:
+        """Fixed allowlist, so a DNS-rebound attacker origin (Host: evil:8788) is refused even though it matches its own Origin."""
+        port = self.server.server_address[1]
+        host = self.headers.get("Host", "")
+        return host in {f"127.0.0.1:{port}", f"localhost:{port}"} or host in tailnet_hosts()
+
+    def log_message(self, fmt: str, *argv: Any) -> None:
+        sys.stderr.write(f"{self.log_date_time_string()} {fmt % argv}\n")
+
+    def send_json(self, status: int, data: Any) -> None:
+        body = json.dumps(data, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = self.path.split("?", 1)[0]
+        try:
+            if path == "/healthz":
+                return self.send_json(200, {"ok": True})
+            if not self.trusted_host():
+                return self.send_json(403, {"error": "unknown host"})
+            if path == "/api/runs":
+                return self.send_json(200, list_runs())
+            match = re.fullmatch(r"/api/runs/(r[0-9]+)/verdict", path)
+            if match:
+                folder = sub("runs") / match[1]
+                if not (folder / "manifest.json").exists():
+                    return self.send_json(404, {"error": "no such run"})
+                return self.send_json(200, read_json(folder / "verdict.json", None) or empty_verdict())
+            if path in ("/", "/index.html"):
+                return self.send_file(WEB_DIR / "index.html")
+            if re.fullmatch(r"/(app\.js|app\.css|geist\.woff2)", path):
+                return self.send_file(WEB_DIR / path[1:])
+            match = re.fullmatch(r"/runs/(r[0-9]+)/([A-Za-z0-9._-]+)", path)
+            if match and not match[2].startswith("."):
+                return self.send_file(sub("runs") / match[1] / match[2])
+            self.send_json(404, {"error": "not found"})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_POST(self) -> None:  # noqa: N802
+        match = re.fullmatch(r"/api/runs/(r[0-9]+)/verdict", self.path)
+        if not match:
+            return self.send_json(404, {"error": "not found"})
+        origin = self.headers.get("Origin")
+        host = self.headers.get("Host", "")
+        if not self.trusted_host() or (origin and re.sub(r"^https?://", "", origin) != host):
+            return self.send_json(403, {"error": "cross-origin write refused"})
+        if self.headers.get("X-UIReview") != "1" or not self.headers.get("Content-Type", "").startswith("application/json"):
+            return self.send_json(400, {"error": "JSON with X-UIReview: 1 only"})
+        declared = self.headers.get("Content-Length") or "0"
+        if not declared.isdigit():
+            return self.send_json(400, {"error": "bad Content-Length"})
+        length = int(declared)
+        if length > 8192:
+            return self.send_json(413, {"error": "body too large"})
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(body, dict):
+                raise ValueError
+        except ValueError:
+            return self.send_json(400, {"error": "invalid JSON"})
+        if not (sub("runs") / match[1] / "manifest.json").exists():
+            return self.send_json(404, {"error": "no such run"})
+        status, data = apply_verdict(match[1], body)
+        self.send_json(status, data)
+
+    def send_file(self, path: Path) -> None:
+        if not path.is_file():
+            return self.send_json(404, {"error": "not found"})
+        stat = path.stat()
+        modified = email.utils.formatdate(stat.st_mtime, usegmt=True)
+        if self.headers.get("If-Modified-Since") == modified and not self.headers.get("Range"):
+            self.send_response(304)
+            self.end_headers()
+            return
+        size = stat.st_size
+        try:
+            span = parse_range(self.headers.get("Range"), size)
+        except ValueError:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.end_headers()
+            return
+        start, end = span or (0, size - 1)
+        self.send_response(206 if span else 200)
+        kind = {".webp": "image/webp", ".mp4": "video/mp4", ".js": "text/javascript; charset=utf-8",
+                ".css": "text/css; charset=utf-8", ".html": "text/html; charset=utf-8",
+                ".json": "application/json; charset=utf-8", ".woff2": "font/woff2"}.get(path.suffix) or mimetypes.guess_type(path.name)[0]
+        self.send_header("Content-Type", kind or "application/octet-stream")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1 if size else 0))
+        if span:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Last-Modified", modified)
+        self.send_header("Cache-Control", "no-cache")
+        if path.suffix == ".html":
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            self.send_header("X-Frame-Options", "DENY")
+        self.end_headers()
+        if self.command == "HEAD" or not size:
+            return
+        with open(path, "rb") as handle:
+            handle.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                chunk = handle.read(min(1 << 16, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+
+    do_HEAD = do_GET
+
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    print(f"uireview serving {root()} on http://127.0.0.1:{args.port}", file=sys.stderr)
+    server.serve_forever()
+
+
+def healthy() -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/healthz", timeout=2) as response:
+            return response.status == 200
+    except OSError:
+        return False
+
+
+# ---------- install / doctor ----------
+
+PLIST = Path.home() / "Library/LaunchAgents" / f"{LAUNCH_LABEL}.plist"
+
+
+def cmd_install(args: argparse.Namespace) -> None:
+    script = Path(os.path.realpath(__file__))
+    link = Path.home() / ".local/bin/uireview"
+    if link.exists() and not link.is_symlink():
+        raise Fail(f"{link} is a regular file, not this tool's symlink; move it away (trash) and run install again")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink():
+        link.unlink()
+    link.symlink_to(script)
+    logs = sub("logs")
+    PLIST.parent.mkdir(parents=True, exist_ok=True)
+    PLIST.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{LAUNCH_LABEL}</string>
+  <key>ProgramArguments</key><array><string>/usr/bin/env</string><string>python3</string><string>{script}</string><string>serve</string></array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>UIREVIEW_ROOT</key><string>{root().resolve()}</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>{logs}/serve.log</string>
+  <key>StandardErrorPath</key><string>{logs}/serve.log</string>
+</dict></plist>
+""")
+    domain = f"gui/{os.getuid()}"
+    run(["launchctl", "bootout", f"{domain}/{LAUNCH_LABEL}"])
+    done = run(["launchctl", "bootstrap", domain, str(PLIST)])
+    if done.returncode:
+        raise Fail(f"launchctl bootstrap failed: {done.stderr.strip()}")
+    serve = run(["tailscale", "serve", "--bg", "--yes", f"--http={TAILNET_PORT}", f"http://127.0.0.1:{PORT}"])
+    if serve.returncode:
+        print(f"⚠️  tailscale serve failed: {serve.stderr.strip()}", file=sys.stderr)
+    write_json(root() / "config.json", {"url": site_url()})
+    print(f"installed: {link} → {script}\nLaunchAgent {LAUNCH_LABEL}; site {site_url()}/")
+    time.sleep(1)
+    cmd_doctor(args)
+
+
+def site_checks() -> list[tuple[bool, str, str]]:
+    """(passed, what, fix) for everything a published link depends on; shared by doctor and publish."""
+    checks = [(healthy(), f"server answers on 127.0.0.1:{PORT}", f"see {root() / 'logs/serve.log'}")]
+    ranges = "byte ranges (206) for iOS Safari video"
+    try:
+        request = urllib.request.Request(f"http://127.0.0.1:{PORT}/app.css", headers={"Range": "bytes=0-1"})
+        with urllib.request.urlopen(request, timeout=2) as response:
+            checks.append((response.status == 206 and len(response.read()) == 2, ranges, ""))
+    except OSError as error:
+        checks.append((False, ranges, str(error)))
+    serve = run(["tailscale", "serve", "status"]).stdout
+    checks.append((f":{TAILNET_PORT}" in serve and f"127.0.0.1:{PORT}" in serve,
+                   f"tailscale serve :{TAILNET_PORT} → 127.0.0.1:{PORT} (tailnet only)",
+                   f"tailscale serve --bg --http={TAILNET_PORT} http://127.0.0.1:{PORT}"))
+    checks.append(("funnel" not in serve.lower(), "no Funnel exposure", "tailscale funnel reset"))
+    return checks
+
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    ok = True
+
+    def line(passed: bool, what: str, fix: str = "") -> None:
+        nonlocal ok
+        ok = ok and passed
+        print(f"{'✅' if passed else '❌'} {what}{'' if passed else '  → ' + fix}")
+
+    agent = run(["launchctl", "print", f"gui/{os.getuid()}/{LAUNCH_LABEL}"])
+    line(agent.returncode == 0 and "state = running" in agent.stdout, f"LaunchAgent {LAUNCH_LABEL} running", "uireview install")
+    for check in site_checks():
+        line(*check)
+    for tool in ("magick", "ffmpeg", "ffprobe", "trash", "sim-use", "xcrun"):
+        line(shutil.which(tool) is not None, f"{tool} on PATH", f"install {tool}")
+    print(f"ℹ️  state root {root()}: {human(dir_size(root()))}; site {site_url()}/")
+    if not ok:
+        raise SystemExit(1)
+
+
+# ---------- cli ----------
+
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = argparse.ArgumentParser(prog="uireview", description=__doc__.split("\n\n")[0])
+    cmds = parser.add_subparsers(dest="cmd", required=True, metavar="<command>")
+
+    p = cmds.add_parser("base", help="save the before build at task start")
+    base = p.add_subparsers(dest="sub", required=True, metavar="save")
+    q = base.add_parser("save", help="clone an .app (APFS) as the baseline for later captures")
+    q.add_argument("--project", required=True)
+    q.add_argument("--app", required=True, help="path to the built .app")
+    q.add_argument("--repo", help="git checkout the build came from (records sha / dirty fingerprint)")
+    q.set_defaults(func=cmd_base_save)
+
+    p = cmds.add_parser("capture", help="replay one recipe on the base build and the current build")
+    p.add_argument("--project", required=True)
+    p.add_argument("--udid", required=True)
+    p.add_argument("--bundle", required=True)
+    p.add_argument("--app", required=True, help="the after build")
+    p.add_argument("--recipe", required=True, help="bash script that drives the app and calls `uireview shot`")
+    p.add_argument("--title", required=True)
+    p.add_argument("--repo", help="git checkout of the after build")
+    p.add_argument("--cwd", help="working directory for the recipe (default: current)")
+    p.add_argument("--base", help="base id (default: the latest for --project)")
+    p.add_argument("--no-base", action="store_true", help="after-only screens run: each card is judged on its own")
+    p.add_argument("--rotate", type=int, default=0, choices=(0, 90, 180, 270), help="clockwise rotation for raw screenshots")
+    p.add_argument("--round-of", help="earlier run this one supersedes (a rework round)")
+    p.add_argument("--timeout", type=int, default=900, help="seconds per side")
+    p.set_defaults(func=cmd_capture)
+
+    p = cmds.add_parser("start", help="open an after-only screens run on the installed build, shot while you drive")
+    p.add_argument("--project", required=True)
+    p.add_argument("--udid", required=True)
+    p.add_argument("--bundle", required=True, help="bundle id of the installed app; its build is the run's build")
+    p.add_argument("--title", required=True)
+    p.add_argument("--repo", help="git checkout of the installed build")
+    p.add_argument("--rotate", type=int, default=0, choices=(0, 90, 180, 270), help="clockwise rotation for raw screenshots")
+    p.add_argument("--round-of", help="earlier run this one supersedes (a rework round)")
+    p.set_defaults(func=cmd_start)
+
+    p = cmds.add_parser("shot", help="take a stable screenshot + accessibility snapshot (in a recipe, or --run)")
+    p.add_argument("name", help="card slug, the same on both sides")
+    p.add_argument("--run", help="a run opened by `uireview start` (outside a recipe)")
+    p.add_argument("--label", help="human title for the card")
+    p.add_argument("--tries", type=int, default=8)
+    p.add_argument("--interval", type=float, default=0.4)
+    p.set_defaults(func=cmd_shot)
+
+    p = cmds.add_parser("clip", help="record the screen while a command drives the app (in a recipe, or --run)",
+                        usage="uireview clip <name> [--run rN] [--label L] [--timeout S] [--settle S] -- <command> [args...]")
+    p.add_argument("name", help="card slug; also take `uireview shot <name>`")
+    p.add_argument("--run", help="a run opened by `uireview start` (outside a recipe)")
+    p.add_argument("--label", help="human title for the clip")
+    p.add_argument("--timeout", type=float, default=20.0, help="seconds the command may run")
+    p.add_argument("--settle", type=float, default=1.0, help="seconds to keep recording after the command")
+    p.set_defaults(func=cmd_clip)
+
+    p = cmds.add_parser("publish", help="validate notes.json, build assets, put the run on the site")
+    p.add_argument("run")
+    p.set_defaults(func=cmd_publish)
+
+    p = cmds.add_parser("verdict", help="read the owner's verdicts for a run")
+    p.add_argument("run")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_verdict)
+
+    p = cmds.add_parser("close", help="mark a run decided without per-card verdicts")
+    p.add_argument("run")
+    p.add_argument("--reopen", action="store_true")
+    p.set_defaults(func=cmd_close)
+
+    p = cmds.add_parser("list", help="list published runs")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = cmds.add_parser("prune", help="move expired runs, raw shots and bases to the Trash")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_prune)
+
+    p = cmds.add_parser("serve", help="run the web server (the LaunchAgent runs this)")
+    p.add_argument("--port", type=int, default=PORT)
+    p.set_defaults(func=cmd_serve)
+
+    p = cmds.add_parser("install", help="symlink the CLI, load the LaunchAgent, configure tailscale serve")
+    p.set_defaults(func=cmd_install)
+    p = cmds.add_parser("doctor", help="check server, byte ranges, tailscale serve, tools")
+    p.set_defaults(func=cmd_doctor)
+
+    argv = sys.argv[1:] if argv is None else list(argv)
+    command: list[str] = []
+    if argv[:1] == ["clip"] and "--" in argv:
+        argv, command = argv[:argv.index("--")], argv[argv.index("--") + 1:]
+    args = parser.parse_args(argv)
+    args.command = command
+    # The site shows run ids as R12, so people type them back that way.
+    for key, flag in (("run", "run id"), ("round_of", "--round-of")):
+        value = getattr(args, key, None)
+        if value:
+            setattr(args, key, value.lower())
+            if not RUN_ID.match(value.lower()):
+                parser.error(f"{flag} looks like r12, got {value!r}")
+    try:
+        args.func(args)
+    except Fail as error:
+        print(f"uireview: {error}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
