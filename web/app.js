@@ -353,6 +353,7 @@ async function renderRun(runId, cardId, isCurrent) {
           const closing = !s.verdict.closed;
           if (closing && !confirm(`關閉 ${label(runId)}？未裁決的卡片也視為結案。`)) return;
           const res = await postVerdict(runId, { rev: s.verdict.rev, closed: closing });
+          if (res.status === 200 && closing) { location.hash = ""; return; }
           if (res.status === 409) conflictNotice = `其他裝置剛改過，已載入最新狀態；${closing ? "關閉" : "重新開啟"}沒有生效，請再按一次`;
           if (res.status === 200 || res.status === 409) return route();
           status.textContent = `失敗（${res.status}）`;
@@ -411,7 +412,7 @@ function renderCard(s, card, screens) {
     compare(card, src, screens),
     card.video && video(card, src, screens),
     card.video_error && notice(`錄影失敗：${card.video_error}`),
-    (card.rois || []).map(roi => roiPair(roi, src, screens)),
+    (card.rois || []).map(roi => roiPair(card, roi, src, screens)),
   ]);
   // Wide screens put media on the left and text + verdict on the right; narrow screens read top to bottom.
   const section = h("section", { class: `card${unchanged ? " unchanged" : ""}`, id: card.id },
@@ -467,14 +468,19 @@ function compare(card, src, screens) {
     return img;
   });
   box.append(...images);
+  const title = `${card.id} · ${card.label || card.name}`;
+  const zoomSides = sides.map(side => ({ label: side === "before" ? "Before" : "After", src: src(card[side].img) }));
   if (sides.length === 1) {
-    if (!screens) box.append(h("span", { class: "side-tag caption-3" }, sides[0] === "after" ? "只有 After" : "只有 Before"));
+    const only = !screens && (sides[0] === "after" ? "只有 After" : "只有 Before");
+    if (only) box.append(h("span", { class: "side-tag caption-3" }, only));
+    zoomable(box, { title, sides: zoomSides, at: () => 0, pick: () => {}, note: only });
     return h("div", { class: "compare" }, box);
   }
   let showing = 0;
   const pick = i => { showing = i; images.forEach((img, j) => img.classList.toggle("off", i !== j)); };
   const control = seg(["Before", "After"], 0, pick);
-  box.addEventListener("click", () => { pick(1 - showing); control.select(showing); });
+  // The viewer's swap carries back here, so closing it leaves the inline shot on the side last looked at.
+  zoomable(box, { title, sides: zoomSides, at: () => showing, pick: i => { pick(i); control.select(i); } });
   return h("div", { class: "compare" }, control, box);
 }
 
@@ -489,11 +495,16 @@ function video(card, src, screens) {
   return h("div", { class: "video" }, el, h("div", { class: "video-bar" }, speeds, layout && h("span", { class: "caption-5 mute" }, layout)));
 }
 
-function roiPair(roi, src, screens) {
+function roiPair(card, roi, src, screens) {
   const width = roi.width_pt || 0;
+  const present = ["before", "after"].filter(side => roi[side]);
+  const zoomSides = present.map(side => ({ label: side === "before" ? "Before" : "After", src: src(roi[side]) }));
+  const title = `${card.id} · ${roi.label}`;
   // Each crop asks for its 1:1 width; the pair wraps to a stack when both do not fit side by side.
   const fig = side => roi[side] && h("figure", { style: width ? `flex-basis:${width}px` : null },
-    h("img", { src: src(roi[side]), alt: `${roi.label} ${side}`, loading: "lazy", decoding: "async", style: width ? `max-width:${width}px` : null }),
+    zoomable(
+      h("img", { src: src(roi[side]), alt: `${roi.label} ${side}`, loading: "lazy", decoding: "async", style: width ? `max-width:${width}px` : null }),
+      { title, sides: zoomSides, at: () => present.indexOf(side), pick: () => {} }),
     !screens && h("figcaption", { class: "caption-4" }, side === "before" ? "Before" : "After"));
   return h("div", { class: "roi" },
     h("div", { class: "roi-label" }, h("span", { class: "title-4" }, roi.label), h("span", { class: "scale caption-5" }, "1:1")),
@@ -512,12 +523,111 @@ function techDetails(manifest) {
     h("table", {}, rows.map(([k, v]) => h("tr", {}, h("td", {}, k), h("td", {}, v)))));
 }
 
+// ---------- viewer ----------
+
+// item: { title, sides: [{ label, src }], at() → side shown when opened, pick(i) → mirror a swap inline, note? }.
+function zoomable(el, item) {
+  el.zoom = item;
+  el.classList.add("zoomable");
+  el.setAttribute("role", "button");
+  el.setAttribute("tabindex", "0");
+  el.setAttribute("aria-label", `放大 ${item.title}`);
+  el.addEventListener("click", () => openViewer(el));
+  el.addEventListener("keydown", ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openViewer(el); } });
+  return el;
+}
+
+let viewer = null;
+
+function openViewer(opener) {
+  if (!viewer) viewer = buildViewer();
+  // Collapsed unchanged cards have no layout box, so browsing skips them.
+  const gallery = [...app.querySelectorAll(".zoomable")].filter(el => el.getClientRects().length);
+  viewer.open(gallery, gallery.indexOf(opener));
+}
+
+function closeViewer() {
+  if (viewer && viewer.dialog.open) viewer.dialog.close();
+}
+
+function buildViewer() {
+  let gallery = [], index = 0, item = null, images = [], showing = 0;
+  const count = h("span", { class: "viewer-count caption-4" });
+  const title = h("span", { class: "viewer-title title-4" });
+  const original = h("a", { class: "viewer-open button-sm", target: "_blank", rel: "noopener" }, "原圖");
+  const frame = h("div", { class: "viewer-frame" });
+  const control = seg(["Before", "After"], 0, i => pick(i));
+  const note = h("span", { class: "viewer-note caption-4" });
+  const prev = h("button", { type: "button", class: "icon-btn", "aria-label": "上一張", onclick: () => go(index - 1) }, icon("back"));
+  const next = h("button", { type: "button", class: "icon-btn", "aria-label": "下一張", onclick: () => go(index + 1) }, icon("right"));
+  const dialog = h("dialog", {
+    class: "viewer",
+    tabindex: "-1",
+    "aria-label": "截圖",
+    // A tap on the screenshot swaps sides like the inline switch; a tap anywhere around it closes.
+    onclick: ev => {
+      if (ev.target.tagName === "IMG") { if (images.length > 1) pick(1 - showing); }
+      else if (ev.target === dialog || ev.target.classList.contains("viewer-stage") || ev.target === frame) dialog.close();
+    },
+    onkeydown: ev => {
+      if (ev.key === "ArrowLeft") go(index - 1);
+      else if (ev.key === "ArrowRight") go(index + 1);
+    },
+    onclose: () => {
+      frame.replaceChildren();
+      const el = gallery[index];
+      if (el && el.isConnected) el.focus();
+    },
+  },
+    h("div", { class: "viewer-bar" }, count, title, original,
+      h("button", { type: "button", class: "icon-btn", "aria-label": "關閉", onclick: () => dialog.close() }, icon("x"))),
+    h("div", { class: "viewer-stage" }, frame),
+    h("div", { class: "viewer-foot" }, prev, h("div", { class: "viewer-mid" }, control, note), next));
+  document.body.append(dialog);
+
+  function go(i) {
+    if (!gallery.length) return;
+    index = (i + gallery.length) % gallery.length;
+    item = gallery[index].zoom;
+    showing = item.at();
+    // Both sides stay stacked so the swap never waits for a decode, same as the inline shot.
+    images = item.sides.map((side, j) => h("img", { src: side.src, alt: `${item.title} ${side.label}`, class: j === showing ? null : "off" }));
+    frame.replaceChildren(...images);
+    count.textContent = `${index + 1} / ${gallery.length}`;
+    title.textContent = item.title;
+    prev.hidden = next.hidden = gallery.length < 2;
+    control.hidden = images.length < 2;
+    control.select(showing);
+    note.textContent = item.note || "";
+    original.href = item.sides[showing].src;
+  }
+
+  function pick(i) {
+    showing = i;
+    images.forEach((img, j) => img.classList.toggle("off", i !== j));
+    control.select(i);
+    original.href = item.sides[i].src;
+    item.pick(i);
+  }
+
+  return {
+    dialog,
+    open(list, at) {
+      gallery = list;
+      go(Math.max(at, 0));
+      dialog.showModal();
+      dialog.focus();
+    },
+  };
+}
+
 // ---------- routing ----------
 
 // Each route bumps the generation, so a slow response for a page the user already left cannot repaint it.
 let routeGen = 0;
 
 async function route() {
+  closeViewer();
   const gen = ++routeGen;
   const isCurrent = () => gen === routeGen;
   const [runId, cardId] = location.hash.replace(/^#\/?/, "").split("/");
@@ -535,7 +645,7 @@ window.addEventListener("hashchange", () => {
   const cardId = location.hash.split("/")[1];
   if (runId && runId === lastRun && cardId) {
     const el = document.getElementById(cardId);
-    if (el) { setOpen(el, true); el.scrollIntoView(); return; }
+    if (el) { closeViewer(); setOpen(el, true); el.scrollIntoView(); return; }
   }
   lastRun = runId || null;
   route();

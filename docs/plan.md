@@ -85,7 +85,9 @@ ROI：兩側各自用 AX frame 解析，取聯集加 padding，套到兩側，�
 
 Run 頁（`/#<run-id>`，沿用 r00-probe 的卡片）：
 - 頁首：需要你判斷、多久前拍的、狀態提示（已關閉、被取代、重做、A/A）；agent 回報的檢查收合；base / after 的 build hash 放在頁尾「技術細節」。
-- 每張卡：`C02`、狀態 tag（Changed / New / Unchanged 收合 / Motion；screens run 的卡不顯示 tag）、改了什麼、請看哪裡、連拍不穩時的提示、Before / After 切換（也可點圖）、1:1 ROI、錄影（若有）、通過 ✅ / 要改 ❌ / 有疑問 ❓ + 備註。
+- 每張卡：`C02`、狀態 tag（Changed / New / Unchanged 收合 / Motion；screens run 的卡不顯示 tag）、改了什麼、請看哪裡、連拍不穩時的提示、Before / After 切換、1:1 ROI、錄影（若有）、通過 ✅ / 要改 ❌ / 有疑問 ❓ + 備註。
+- 放大（2026-11）：點截圖或 ROI 開全螢幕 viewer（`<dialog>`，參考 maestro-lang-ios nightly 報告的截圖 viewer）。viewer 裡點圖切 Before / After，切到哪一邊會同步回卡片上的切換；左右鍵或底部按鈕跳到同一個 run 的上一張 / 下一張（略過收合的 Unchanged 卡），點圖以外的地方、✕ 或 Esc 關閉，關閉後焦點回到最後看的那張圖。點圖原本是切換，改成放大是因為手機上 iPad 截圖太小看不清；卡片上的切換改由上方的 Before / After 鍵負責。
+- 按「關閉這個 run」成功後回到列表；「重新開啟」留在 run 頁。
 - 版面：手機單欄由上往下（文字 → 圖 → 裁決）。視窗 ≥ 1024px 時 run 頁加寬到 1240px，每張卡左欄放截圖、錄影、ROI，右欄 340px 放文字和裁決，看圖時不用上下捲動找按鈕；截圖高度限制在一個視窗內。首頁維持 720px。Before / After 不做並排，因為差異要靠閃換才看得出來。
 - 外觀（2026-11 改版）：只有 light mode，Geist + PingFang TC，Phosphor icon。Before / After 切換刻意不做轉場：差異要靠瞬間閃換才看得出來。只有第一次載入有很輕的進場（上移 6px、2px blur 轉清楚，0.8 秒內），截圖第一次載入時從 skeleton 轉清楚；換頁、切換、裁決都不播放大動畫。
 - 裁決存在 server（`verdict.json`），iPhone 和 mbp 看到同一份。存成功才顯示「已儲存」。
