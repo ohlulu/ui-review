@@ -27,6 +27,13 @@
   --e: cubic-bezier(0.16, 1, 0.3, 1);
   --e2: cubic-bezier(0.33, 1, 0.68, 1);
   --out: cubic-bezier(0.23, 1, 0.32, 1);
+  --zoom: 1;
+}
+
+/* Large desktop windows render the whole shell at 1.5×, the size the owner picked with browser zoom.
+   The threshold keeps at least 1024 zoomed px, so the wide layout below still fits. */
+@media (hover: hover) and (pointer: fine) and (min-width: 1536px) {
+  :root { --zoom: 1.5; zoom: 1.5; }
 }
 
 * { box-sizing: border-box; }
@@ -295,8 +302,9 @@ html:has(.viewer[open]) { overflow: hidden; }
   .card-body.split > .media { grid-area: media; }
   .card-body.split > .act { grid-area: act; align-self: start; }
   .card-body.split > .info > :first-child, .card-body.split > .media > :first-child { margin-top: 0; }
-  .media .shot { width: min(100%, calc((100vh - 200px) * var(--ratio, 1))); }
-  .media .video video { max-height: calc(100vh - 200px); }
+  /* CSS zoom scales vh with the element, so divide it back out to stay within one viewport. */
+  .media .shot { width: min(100%, calc((100vh / var(--zoom) - 200px) * var(--ratio, 1))); }
+  .media .video video { max-height: calc(100vh / var(--zoom) - 200px); }
 }
 
 @media (hover: hover) and (pointer: fine) {
