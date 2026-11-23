@@ -127,6 +127,18 @@ function seg(labels, active, onpick) {
 // ---------- list ----------
 
 let projectFilter = null;
+// A close from the list that failed survives the refresh that follows it.
+let listNotice = null;
+
+// Reads the newest rev first, so a close never sends a stale one; returns the HTTP status (0 when offline).
+async function closeRun(runId) {
+  try {
+    const verdict = await getJSON(`/api/runs/${runId}/verdict`);
+    return (await postVerdict(runId, { rev: verdict.rev, closed: true })).status;
+  } catch {
+    return 0;
+  }
+}
 
 async function renderList(isCurrent) {
   const runs = await getJSON("/api/runs");
@@ -149,11 +161,31 @@ async function renderList(isCurrent) {
       onclick: () => { projectFilter = p; route(); },
     }, p || "全部")));
 
+  const closeAll = pending.length > 1 && h("button", {
+    type: "button",
+    class: "closebtn close-all button-sm",
+    onclick: async ev => {
+      const scope = projectFilter ? ` ${projectFilter} 的` : "";
+      if (!confirm(`關閉${scope}全部 ${pending.length} 個待裁決 run？會視為已裁決，7 天後清除。`)) return;
+      ev.target.disabled = true;
+      ev.target.textContent = "關閉中…";
+      const results = await Promise.all(pending.map(r => closeRun(r.id)));
+      const failed = pending.filter((_, i) => results[i] !== 200).map(r => label(r.id));
+      if (failed.length) listNotice = `${failed.join("、")} 沒關成功，請再試一次`;
+      route();
+    },
+  }, "全部關閉");
+  const notices = listNotice && h("div", { class: "notices" }, notice(listNotice));
+  listNotice = null;
+
   show(
     h("header", { class: "page-head" }, h("h1", { class: "heading-4 hero" }, "UI Review")),
     filters,
+    notices,
     h("section", { class: "group" },
-      h("h2", { class: "group-label title-4" }, "待裁決", pending.length && h("span", { class: "count" }, pending.length)),
+      h("div", { class: "group-head" },
+        h("h2", { class: "group-label title-4" }, "待裁決", pending.length && h("span", { class: "count" }, pending.length)),
+        closeAll),
       h("div", { class: "list" }, pending.length ? pending.map(r => pendingRow(r, showProject)) : h("div", { class: "empty" },
         icon("done"),
         h("div", { class: "title-3" }, "都看完了"),
@@ -171,19 +203,20 @@ async function renderList(isCurrent) {
 
 function pendingRow(r, showProject) {
   const meta = [showProject && r.project, r.round_of && `重做 ${label(r.round_of)}`, ago(r.published)].filter(Boolean).join(" · ");
-  const close = r.stale && h("button", {
+  const close = h("button", {
     type: "button",
-    class: "closebtn button-sm",
+    class: "closebtn row-close",
+    "aria-label": `關閉 ${label(r.id)}`,
+    title: "關閉",
     onclick: async ev => {
       ev.preventDefault();
       ev.stopPropagation();
       if (!confirm(`關閉 ${label(r.id)}？會視為已裁決，7 天後清除。`)) return;
-      const verdict = await getJSON(`/api/runs/${r.id}/verdict`);
-      const res = await postVerdict(r.id, { rev: verdict.rev, closed: true });
-      if (res.status !== 200) { ev.target.textContent = `關閉失敗（${res.status}）`; return; }
+      const status = await closeRun(r.id);
+      if (status !== 200) { listNotice = `${label(r.id)} 沒關成功（${status || "離線"}），請再試一次`; }
       route();
     },
-  }, "關閉");
+  }, icon("x"));
   return h("a", { class: "row", href: `#${r.id}` },
     h("span", { class: "rid title-3" }, label(r.id)),
     h("div", { class: "main" },
