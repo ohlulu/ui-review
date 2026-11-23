@@ -162,6 +162,26 @@ button, a, summary, .shot {
 .tag.warn { background: var(--warn-soft); color: var(--warn); }
 .tag.bad { background: var(--bad-soft); color: var(--bad); }
 
+/* ---------- undo toast ---------- */
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
+.toast {
+  position: fixed; left: 16px; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 10;
+  width: fit-content; max-width: 480px; margin: 0 auto;
+  display: flex; align-items: center; gap: 12px; padding: 8px 8px 8px 16px; border-radius: 12px;
+  background: var(--ink); color: #fff; box-shadow: 0 8px 24px rgba(24, 24, 27, 0.24);
+  animation: toast-in 200ms var(--out);
+  transition: opacity 150ms ease, transform 150ms ease;
+}
+.toast.leaving { opacity: 0; transform: translateY(8px); }
+.toast-text { flex: 1; min-width: 0; }
+.toast-undo {
+  flex: none; border: 0; background: transparent; color: #93c5fd;
+  padding: 6px 12px; border-radius: 8px; min-height: 32px; cursor: pointer;
+  transition: background-color 150ms ease, transform 160ms var(--out);
+}
+.toast-undo:active { transform: scale(0.97); }
+.toast-undo:disabled { color: #a1a1aa; transform: none; }
+
 /* ---------- run ---------- */
 .back { display: inline-flex; align-items: center; gap: 4px; color: var(--ink-2); padding: 8px 8px 8px 0; margin-bottom: 8px; }
 .run-head { margin-bottom: 16px; }
@@ -319,6 +339,7 @@ html:has(.viewer[open]) { overflow: hidden; }
   .btn.pass-all:hover { background: #dcfce7; }
   .vbtn:not(.on):hover { border-color: #d4d4d8; color: var(--ink); }
   .icon-btn:hover, .viewer-open:hover { background: var(--fill); }
+  .toast-undo:not(:disabled):hover { background: rgba(255, 255, 255, 0.1); }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -328,4 +349,6 @@ html:has(.viewer[open]) { overflow: hidden; }
   .card.unchanged.open .card-body { animation: none; }
   .viewer[open] .viewer-frame img { animation: none; }
   .icon-btn:active { transform: none; }
+  .toast { animation: fade 200ms ease; }
+  .toast.leaving, .toast-undo:active { transform: none; }
 }

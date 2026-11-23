@@ -130,14 +130,72 @@ let projectFilter = null;
 // A close from the list that failed survives the refresh that follows it.
 let listNotice = null;
 
-// Reads the newest rev first, so a close never sends a stale one; returns the HTTP status (0 when offline).
-async function closeRun(runId) {
+// Reads the newest rev first, so a close or reopen never sends a stale one; returns the HTTP status (0 when offline).
+async function setClosed(runId, closed) {
   try {
     const verdict = await getJSON(`/api/runs/${runId}/verdict`);
-    return (await postVerdict(runId, { rev: verdict.rev, closed: true })).status;
+    return (await postVerdict(runId, { rev: verdict.rev, closed })).status;
   } catch {
     return 0;
   }
+}
+
+// Closes without asking first; returns the ids that closed and leaves a notice naming the ones that did not.
+async function closeRuns(ids) {
+  const results = await Promise.all(ids.map(id => setClosed(id, true)));
+  const failed = ids.filter((_, i) => results[i] !== 200);
+  if (failed.length) listNotice = `${failed.map(id => label(id)).join("、")} 沒關成功，請再試一次`;
+  const closed = ids.filter((_, i) => results[i] === 200);
+  if (closed.length) undoToast(closed);
+  return closed;
+}
+
+// ---------- undo toast ----------
+
+const TOAST_MS = 8000;
+// One toast at a time: a newer close replaces the older toast, and its undo with it.
+let toast = null;
+
+function undoToast(ids) {
+  dismissToast();
+  const text = h("span", { class: "toast-text body-6" }, ids.length === 1 ? `已關閉 ${label(ids[0])}` : `已關閉 ${ids.length} 個 run`);
+  const undo = h("button", {
+    type: "button",
+    class: "toast-undo button-sm",
+    onclick: async () => {
+      undo.disabled = true;
+      clearTimeout(el.timer);
+      const results = await Promise.all(ids.map(id => setClosed(id, false)));
+      const failed = ids.filter((_, i) => results[i] !== 200);
+      if (failed.length) {
+        text.textContent = `${failed.map(id => label(id)).join("、")} 沒復原成功，可以到 run 頁重新開啟`;
+        undo.remove();
+        arm();
+      } else {
+        dismissToast();
+      }
+      route();
+    },
+  }, "復原");
+  const el = h("div", { class: "toast", role: "status" }, text, undo);
+  // The timer pauses while the owner is reaching for the button.
+  const arm = () => { clearTimeout(el.timer); el.timer = setTimeout(dismissToast, TOAST_MS); };
+  el.addEventListener("pointerenter", () => clearTimeout(el.timer));
+  el.addEventListener("pointerleave", arm);
+  el.addEventListener("focusin", () => clearTimeout(el.timer));
+  el.addEventListener("focusout", arm);
+  document.body.append(el);
+  toast = el;
+  arm();
+}
+
+function dismissToast() {
+  if (!toast) return;
+  const el = toast;
+  toast = null;
+  clearTimeout(el.timer);
+  el.classList.add("leaving");
+  setTimeout(() => el.remove(), 150);
 }
 
 async function renderList(isCurrent) {
@@ -165,13 +223,9 @@ async function renderList(isCurrent) {
     type: "button",
     class: "closebtn close-all button-sm",
     onclick: async ev => {
-      const scope = projectFilter ? ` ${projectFilter} 的` : "";
-      if (!confirm(`關閉${scope}全部 ${pending.length} 個待裁決 run？會視為已裁決，7 天後清除。`)) return;
-      ev.target.disabled = true;
-      ev.target.textContent = "關閉中…";
-      const results = await Promise.all(pending.map(r => closeRun(r.id)));
-      const failed = pending.filter((_, i) => results[i] !== 200).map(r => label(r.id));
-      if (failed.length) listNotice = `${failed.join("、")} 沒關成功，請再試一次`;
+      ev.currentTarget.disabled = true;
+      ev.currentTarget.textContent = "關閉中…";
+      await closeRuns(pending.map(r => r.id));
       route();
     },
   }, "全部關閉");
@@ -211,9 +265,8 @@ function pendingRow(r, showProject) {
     onclick: async ev => {
       ev.preventDefault();
       ev.stopPropagation();
-      if (!confirm(`關閉 ${label(r.id)}？會視為已裁決，7 天後清除。`)) return;
-      const status = await closeRun(r.id);
-      if (status !== 200) { listNotice = `${label(r.id)} 沒關成功（${status || "離線"}），請再試一次`; }
+      ev.currentTarget.disabled = true;
+      await closeRuns([r.id]);
       route();
     },
   }, icon("x"));
@@ -384,9 +437,8 @@ async function renderRun(runId, cardId, isCurrent) {
         class: "btn button-sm",
         onclick: async () => {
           const closing = !s.verdict.closed;
-          if (closing && !confirm(`關閉 ${label(runId)}？未裁決的卡片也視為結案。`)) return;
           const res = await postVerdict(runId, { rev: s.verdict.rev, closed: closing });
-          if (res.status === 200 && closing) { location.hash = ""; return; }
+          if (res.status === 200 && closing) { undoToast([runId]); location.hash = ""; return; }
           if (res.status === 409) conflictNotice = `其他裝置剛改過，已載入最新狀態；${closing ? "關閉" : "重新開啟"}沒有生效，請再按一次`;
           if (res.status === 200 || res.status === 409) return route();
           status.textContent = `失敗（${res.status}）`;
