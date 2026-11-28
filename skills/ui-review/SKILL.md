@@ -51,7 +51,7 @@ Either replay a recipe on the current build only — `uireview capture … --no-
 
 ## Notes, publish, verdicts
 
-1. **Fill `~/.local/state/ui-review/work/rN/notes.json`** (text only, keep card ids and order):
+1. **Fill `~/.local/state/ui-review/work/rN/notes.json`** (text only, keep card ids and order). The owner reads cards in Traditional Chinese: write the run `--title`, every `--label`, and all `notes.json` text in 繁體中文 (Taiwan), whatever language the app on screen shows — the screenshots may stay in English.
    - `judge`: the one decision you need from the owner.
    - `checks`: tests and flows you ran, as plain strings.
    - per card `what`: compare — the concrete change ("price column ends at 907 pt, badge starts at 919 pt"); screens — what state this is and what decides whether it is right. Required on every card except `UNCHANGED`.
